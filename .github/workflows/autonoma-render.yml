@@ -1,0 +1,131 @@
+name: Autonoma on Render Preview
+
+# Triggers Autonoma E2E tests against a Render Pull Request Preview URL.
+#
+# Two entry points are supported:
+#
+# 1. repository_dispatch (recommended) — Render's "Deploy succeeded" webhook
+#    should POST to the GitHub "Create a repository dispatch event" API with
+#    event_type: "render-deploy" and a client_payload that includes the
+#    preview URL. See README for a sample webhook relay.
+#
+# 2. deployment_status — if you wire Render to GitHub Deployments, this
+#    workflow also picks up "success" states and pulls the preview URL from
+#    the deployment environment_url.
+
+on:
+  repository_dispatch:
+    types: [render-deploy]
+  deployment_status:
+
+jobs:
+  run-autonoma:
+    # Only run on successful deploys. repository_dispatch events don't have a
+    # "state", so they always pass this check; deployment_status events must
+    # report state == "success".
+    if: >-
+      github.event_name == 'repository_dispatch' ||
+      (github.event_name == 'deployment_status' && github.event.deployment_status.state == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve preview URL
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_URL: ${{ github.event.client_payload.preview_url }}
+          DEPLOYMENT_URL: ${{ github.event.deployment_status.environment_url }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" = "repository_dispatch" ]; then
+            PREVIEW_URL="${DISPATCH_URL:-}"
+          else
+            PREVIEW_URL="${DEPLOYMENT_URL:-}"
+          fi
+
+          if [ -z "${PREVIEW_URL}" ]; then
+            echo "::error::No preview URL found in event payload."
+            echo "Hint: repository_dispatch needs client_payload.preview_url;"
+            echo "      deployment_status needs deployment.environment_url."
+            exit 1
+          fi
+
+          # Strip any trailing slash so BASE_URL stays canonical.
+          PREVIEW_URL="${PREVIEW_URL%/}"
+
+          echo "Resolved preview URL: ${PREVIEW_URL}"
+          echo "preview_url=${PREVIEW_URL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Trigger Autonoma test run
+        id: autonoma
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          BASE_URL: ${{ steps.resolve.outputs.preview_url }}
+          COMMIT_SHA: ${{ github.event.client_payload.commit_sha || github.event.deployment.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number || github.event.deployment.payload.pr_number || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${AUTONOMA_API_KEY}" ]; then
+            echo "::error::AUTONOMA_API_KEY secret is not set."
+            echo "Add it under: Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          echo "Triggering Autonoma run against ${BASE_URL} (sha=${COMMIT_SHA})"
+
+          # Build the JSON body without leaking secrets into the log.
+          BODY=$(jq -n \
+            --arg base_url   "${BASE_URL}" \
+            --arg commit_sha "${COMMIT_SHA}" \
+            --arg pr_number  "${PR_NUMBER}" \
+            '{
+               base_url: $base_url,
+               commit_sha: $commit_sha,
+               pr_number: ($pr_number | select(length > 0))
+             } | with_entries(select(.value != null))')
+
+          HTTP_CODE=$(curl --silent --show-error \
+            --output /tmp/autonoma-response.json \
+            --write-out "%{http_code}" \
+            --request POST \
+            --header "Authorization: Bearer ${AUTONOMA_API_KEY}" \
+            --header "Content-Type: application/json" \
+            --data "${BODY}" \
+            "https://api.getautonoma.com/v1/runs")
+
+          echo "Autonoma API returned HTTP ${HTTP_CODE}"
+          cat /tmp/autonoma-response.json
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "::error::Autonoma API call failed (HTTP ${HTTP_CODE})."
+            exit 1
+          fi
+
+          RUN_ID=$(jq -r '.run_id // .id // empty' /tmp/autonoma-response.json)
+          RUN_URL=$(jq -r '.url // empty' /tmp/autonoma-response.json)
+
+          if [ -n "${RUN_ID}" ]; then
+            echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+            echo "Autonoma run started: ${RUN_ID}"
+          fi
+          if [ -n "${RUN_URL}" ]; then
+            echo "run_url=${RUN_URL}" >> "${GITHUB_OUTPUT}"
+            echo "View run: ${RUN_URL}"
+          fi
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Autonoma on Render Preview"
+            echo ""
+            echo "- Preview URL: ${{ steps.resolve.outputs.preview_url || 'n/a' }}"
+            echo "- Run ID: ${{ steps.autonoma.outputs.run_id || 'n/a' }}"
+            echo "- Run URL: ${{ steps.autonoma.outputs.run_url || 'n/a' }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
